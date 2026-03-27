@@ -1,0 +1,183 @@
+name: Human Review Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-changes:
+    name: Change Safety Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect risky changes
+        id: detect
+        shell: bash
+        run: |
+          echo "=============================="
+          echo "Starting safety review..."
+          echo "=============================="
+
+          BASE_REF="${{ github.event.pull_request.base.ref || 'main' }}"
+          git fetch origin "${BASE_REF}" --depth=1
+
+          NEEDS_REVIEW="false"
+          REVIEW_REASONS=""
+
+          STAT=$(git diff --shortstat "origin/${BASE_REF}...HEAD" 2>/dev/null || echo "")
+          echo "Git stats: $STAT"
+
+          INS=$(echo "$STAT" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' | head -n 1 || true)
+          DEL=$(echo "$STAT" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' | head -n 1 || true)
+          INS=${INS:-0}
+          DEL=${DEL:-0}
+          TOTAL=$((INS + DEL))
+
+          echo "Insertions: $INS | Deletions: $DEL | Total changed lines: $TOTAL"
+
+          if [ "$TOTAL" -gt 100 ]; then
+            echo "[trigger] Change volume exceeded 100 lines."
+            NEEDS_REVIEW="true"
+            REVIEW_REASONS="${REVIEW_REASONS}\n- Large change set detected: **${TOTAL}** changed lines."
+          else
+            echo "Change volume is within the safe range."
+          fi
+
+          CHANGED=$(git diff --name-only "origin/${BASE_REF}...HEAD" 2>/dev/null || echo "")
+          echo ""
+          echo "Changed files:"
+          echo "$CHANGED"
+          echo ""
+
+          CORE_PATTERN='master_monitor\.py|universal_fix\.py|sanitizer\.py|ai_fix\.py|config\.py|\.env|secrets|database|pb_hooks|schema|migration'
+          CORE_HITS=$(echo "$CHANGED" | grep -E "$CORE_PATTERN" || true)
+
+          if [ -n "$CORE_HITS" ]; then
+            echo "[trigger] Core files were modified:"
+            echo "$CORE_HITS"
+            NEEDS_REVIEW="true"
+            REVIEW_REASONS="${REVIEW_REASONS}\n- Core files were modified: \`$(echo "$CORE_HITS" | tr '\n' ' ')\`"
+          else
+            echo "No core files were modified."
+          fi
+
+          WORKFLOW_HITS=$(echo "$CHANGED" | grep -E '^\\.github/|\\.yml$|\\.yaml$' || true)
+          if [ -n "$WORKFLOW_HITS" ]; then
+            echo "[trigger] Workflow files were modified:"
+            echo "$WORKFLOW_HITS"
+            NEEDS_REVIEW="true"
+            REVIEW_REASONS="${REVIEW_REASONS}\n- CI/CD or workflow files were modified: \`$(echo "$WORKFLOW_HITS" | tr '\n' ' ')\`"
+          else
+            echo "No workflow files were modified."
+          fi
+
+          echo ""
+          echo "=============================="
+          if [ "$NEEDS_REVIEW" = "true" ]; then
+            echo "Result: human review required."
+          else
+            echo "Result: change set is safe enough to proceed."
+          fi
+          echo "=============================="
+
+          echo "needs_review=$NEEDS_REVIEW" >> "$GITHUB_OUTPUT"
+          echo "total_lines=$TOTAL" >> "$GITHUB_OUTPUT"
+          {
+            echo "review_reasons<<EOF"
+            echo -e "$REVIEW_REASONS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check approvals
+        if: steps.detect.outputs.needs_review == 'true'
+        id: approvals
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PERSONAL_ACCESS_TOKEN || github.token }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setOutput("approved", "false");
+              return;
+            }
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const latestByUser = new Map();
+            for (const review of reviews) {
+              latestByUser.set(review.user.login, review.state);
+            }
+
+            const approved = [...latestByUser.values()].includes("APPROVED");
+            core.setOutput("approved", approved ? "true" : "false");
+
+      - name: Post human review notice
+        if: steps.detect.outputs.needs_review == 'true' && steps.approvals.outputs.approved != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PERSONAL_ACCESS_TOKEN || github.token }}
+          script: |
+            const reasons = `${{ steps.detect.outputs.review_reasons }}`;
+            const lines = `${{ steps.detect.outputs.total_lines }}`;
+            const prNumber = context.payload.pull_request.number;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: [
+                '## Human review required',
+                '',
+                'Automatic checks detected a potentially risky pull request, so auto-merge should be blocked until a reviewer approves it.',
+                '',
+                reasons || '- A high-risk change was detected.',
+                '',
+                '---',
+                '### How to proceed',
+                '1. Review the changed files carefully.',
+                '2. Confirm the change is safe and expected.',
+                '3. Approve the pull request with a user who has permission to merge.',
+                '',
+                `> Total changed lines: **${lines}**`,
+              ].join('\n'),
+            });
+
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: ['needs-human-review'],
+              });
+            } catch (error) {
+              console.log('Skipping label add:', error.message);
+            }
+
+      - name: Block merge until review
+        if: steps.detect.outputs.needs_review == 'true' && steps.approvals.outputs.approved != 'true'
+        run: |
+          echo "Human review is required before this pull request can be merged."
+          echo "Please approve the pull request manually."
+          exit 1
+
+      - name: Mark check as passed
+        run: |
+          echo "Human review gate passed."
