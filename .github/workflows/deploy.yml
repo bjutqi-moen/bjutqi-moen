@@ -1,0 +1,80 @@
+name: Auto Deploy to Server
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+jobs:
+  deploy:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync code to server
+        uses: easingthemes/ssh-deploy@v5.1.0
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          ARGS: >-
+            -avz
+            --exclude='.git/'
+            --exclude='.github/'
+            --exclude='*.log'
+            --exclude='monitor_*.log'
+            --exclude='.env'
+            --exclude='pb/pb_data/'
+            --exclude='pb/pb_migrations/'
+            --exclude='pb/logs/'
+            --exclude='pb/pocketbase'
+            --exclude='ubuntu/'
+          SOURCE: "./"
+          REMOTE_HOST: ${{ secrets.SSH_HOST }}
+          REMOTE_USER: ${{ secrets.SSH_USER }}
+          TARGET: "/root/"
+
+      - name: Restart services
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            echo "Deployment finished. Restarting services..."
+
+            if ! command -v supervisorctl >/dev/null 2>&1; then
+              echo "supervisorctl is not installed. Skipping service restart."
+              exit 0
+            fi
+
+            if [ ! -f "/root/pb/pocketbase" ] && [ ! -L "/root/pb/pocketbase" ]; then
+              echo "Critical error: /root/pb/pocketbase does not exist. Abort restart to avoid damage."
+              exit 1
+            fi
+
+            SERVICES=("pb" "ai-proxy" "websocket" "master_monitor")
+            FAILED_SERVICES=0
+
+            for SERVICE in "${SERVICES[@]}"; do
+              echo "Restarting $SERVICE..."
+              if sudo supervisorctl restart "$SERVICE"; then
+                echo "$SERVICE restarted successfully."
+              else
+                echo "$SERVICE failed to restart."
+                FAILED_SERVICES=$((FAILED_SERVICES + 1))
+              fi
+            done
+
+            echo ""
+            echo "Current service status:"
+            sudo supervisorctl status
+
+            if [ "$FAILED_SERVICES" -gt 0 ]; then
+              echo "Deployment completed, but $FAILED_SERVICES service(s) failed to restart."
+              exit 1
+            fi
+
+            echo "All services restarted successfully."
