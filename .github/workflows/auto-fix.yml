@@ -23,6 +23,8 @@ jobs:
        contains(github.event.issue.labels.*.name, 'auto-fix') &&
        startsWith(github.event.comment.body, '/apply'))
     runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
 
     steps:
       - name: Checkout repository
@@ -71,6 +73,11 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body || '' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python .github/scripts/ai_fix.py
+
+      - name: Remove Python cache files
+        run: |
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+          find . -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
       - name: Commit changes and create PR
         if: hashFiles('FIX_DONE') != ''
